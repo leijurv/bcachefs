@@ -1158,6 +1158,10 @@ int bch2_bkey_ptrs_invalid(const struct bch_fs *c, struct bkey_s_c k,
 			break;
 		case BCH_EXTENT_ENTRY_stripe_ptr:
 			break;
+		case BCH_EXTENT_ENTRY_reservation:
+			break;
+		case BCH_EXTENT_ENTRY_fragment:
+			break;
 		}
 	}
 
@@ -1200,6 +1204,10 @@ void bch2_ptr_swab(struct bkey_s k)
 				swab64((__force u64) entry->crc128.csum.lo);
 			break;
 		case BCH_EXTENT_ENTRY_stripe_ptr:
+			break;
+		case BCH_EXTENT_ENTRY_reservation:
+			break;
+		case BCH_EXTENT_ENTRY_fragment:
 			break;
 		}
 	}
@@ -1249,7 +1257,7 @@ int bch2_cut_front_s(struct bpos where, struct bkey_s k)
 			case BCH_EXTENT_ENTRY_crc128:
 				entry->crc128.offset += sub;
 				break;
-			case BCH_EXTENT_ENTRY_stripe_ptr:
+			default:
 				break;
 			}
 
