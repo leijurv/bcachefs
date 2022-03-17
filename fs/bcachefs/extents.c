@@ -23,6 +23,7 @@
 #include "super.h"
 #include "super-io.h"
 #include "util.h"
+#include "zone.h"
 
 #include <trace/events/bcachefs.h>
 
@@ -1067,19 +1068,19 @@ static int extent_ptr_invalid(const struct bch_fs *c,
 
 	bucket = sector_to_bucket_and_offset(ca, ptr->offset, &bucket_offset);
 
+	if (bucket < ca->mi.first_bucket) {
+		prt_printf(err, "pointer before first bucket (%llu < %u)",
+		       bucket, ca->mi.first_bucket);
+		return -EINVAL;
+	}
+
 	if (bucket >= ca->mi.nbuckets) {
 		prt_printf(err, "pointer past last bucket (%llu > %llu)",
 		       bucket, ca->mi.nbuckets);
 		return -EINVAL;
 	}
 
-	if (ptr->offset < bucket_to_sector(ca, ca->mi.first_bucket)) {
-		prt_printf(err, "pointer before first bucket (%llu < %u)",
-		       bucket, ca->mi.first_bucket);
-		return -EINVAL;
-	}
-
-	if (bucket_offset + size_ondisk > ca->mi.bucket_size) {
+	if (bucket_offset + size_ondisk > bucket_capacity(ca, bucket)) {
 		prt_printf(err, "pointer spans multiple buckets (%u + %u > %u)",
 		       bucket_offset, size_ondisk, ca->mi.bucket_size);
 		return -EINVAL;

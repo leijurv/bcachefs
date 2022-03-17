@@ -22,6 +22,7 @@
 #include "move.h"
 #include "movinggc.h"
 #include "super-io.h"
+#include "zone.h"
 
 #include <trace/events/bcachefs.h>
 #include <linux/freezer.h>
@@ -61,13 +62,18 @@ static int find_buckets_to_copygc(struct bch_fs *c)
 			   BTREE_ITER_PREFETCH, k, ret) {
 		struct bch_dev *ca = bch_dev_bkey_exists(c, iter.pos.inode);
 		struct copygc_heap_entry e;
+		unsigned bucket_size;
 
 		bch2_alloc_to_v4(k, &a);
 
 		if ((a.data_type != BCH_DATA_btree &&
 		     a.data_type != BCH_DATA_user) ||
-		    a.dirty_sectors >= ca->mi.bucket_size ||
 		    bch2_bucket_is_open(c, iter.pos.inode, iter.pos.offset))
+			continue;
+
+		bucket_size = bucket_capacity(ca, k.k->p.offset);
+
+		if (a.dirty_sectors >= bucket_size)
 			continue;
 
 		e = (struct copygc_heap_entry) {
@@ -75,7 +81,7 @@ static int find_buckets_to_copygc(struct bch_fs *c)
 			.gen		= a.gen,
 			.replicas	= 1 + a.stripe_redundancy,
 			.fragmentation	= div_u64((u64) a.dirty_sectors * (1ULL << 31),
-						  ca->mi.bucket_size),
+						  bucket_size),
 			.sectors	= a.dirty_sectors,
 			.bucket		= iter.pos.offset,
 		};
