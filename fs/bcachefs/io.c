@@ -644,6 +644,7 @@ out:
 err:
 	keys->top = keys->keys;
 	op->error = ret;
+	op->flags |= BCH_WRITE_DONE;
 	goto out;
 }
 
@@ -695,12 +696,12 @@ static void bch2_write_endio(struct bio *bio)
 	if (wbio->put_bio)
 		bio_put(bio);
 
-	if (parent)
+	if (parent) {
 		bio_endio(&parent->bio);
-	else if (!(op->flags & BCH_WRITE_SKIP_CLOSURE_PUT))
-		closure_put(cl);
-	else
-		continue_at_nobarrier(cl, bch2_write_index, index_update_wq(op));
+		return;
+	}
+
+	closure_put(cl);
 }
 
 static void init_append_extent(struct bch_write_op *op,
@@ -1113,7 +1114,6 @@ static void __bch2_write(struct closure *cl)
 	struct bch_fs *c = op->c;
 	struct write_point *wp;
 	struct bio *bio = NULL;
-	bool skip_put = true;
 	unsigned nofs_flags;
 	int ret;
 
@@ -1129,13 +1129,13 @@ again:
 		/* +1 for possible cache device: */
 		if (op->open_buckets.nr + op->nr_replicas + 1 >
 		    ARRAY_SIZE(op->open_buckets.v))
-			goto flush_io;
+			break;
 
 		if (bch2_keylist_realloc(&op->insert_keys,
 					op->inline_keys,
 					ARRAY_SIZE(op->inline_keys),
 					BKEY_EXTENT_U64s_MAX))
-			goto flush_io;
+			break;
 
 		/*
 		 * The copygc thread is now global, which means it's no longer
@@ -1157,13 +1157,13 @@ again:
 
 		if (IS_ERR(wp)) {
 			if (unlikely(wp != ERR_PTR(-EAGAIN))) {
-				ret = PTR_ERR(wp);
-				goto err;
+				op->error = PTR_ERR(wp);
+				op->flags |= BCH_WRITE_DONE;
 			}
 
-			goto flush_io;
+			break;
 		}
-
+#if 0
 		/*
 		 * It's possible for the allocator to fail, put us on the
 		 * freelist waitlist, and then succeed in one of various retry
@@ -1173,32 +1173,25 @@ again:
 		 */
 		if (atomic_read(&cl->remaining) & CLOSURE_WAITING)
 			skip_put = false;
-
+#endif
 		bch2_open_bucket_get(c, wp, &op->open_buckets);
 		ret = bch2_write_extent(op, wp, &bio);
 		bch2_alloc_sectors_done(c, wp);
 
-		if (ret < 0)
-			goto err;
-
-		if (ret) {
-			skip_put = false;
-		} else {
-			/*
-			 * for the skip_put optimization this has to be set
-			 * before we submit the bio:
-			 */
+		if (ret < 0) {
+			op->error = ret;
 			op->flags |= BCH_WRITE_DONE;
+			break;
 		}
+
+		if (!ret)
+			op->flags |= BCH_WRITE_DONE;
 
 		bio->bi_end_io	= bch2_write_endio;
 		bio->bi_private	= &op->cl;
 		bio->bi_opf |= REQ_OP_WRITE;
 
-		if (!skip_put)
-			closure_get(bio->bi_private);
-		else
-			op->flags |= BCH_WRITE_SKIP_CLOSURE_PUT;
+		closure_get(bio->bi_private);
 
 		key_to_write = (void *) (op->insert_keys.keys_p +
 					 key_to_write_offset);
@@ -1207,43 +1200,36 @@ again:
 					  key_to_write);
 	} while (ret);
 
-	if (!skip_put)
-		continue_at(cl, bch2_write_index, index_update_wq(op));
-out:
-	memalloc_nofs_restore(nofs_flags);
-	return;
-err:
-	op->error = ret;
-	op->flags |= BCH_WRITE_DONE;
-
-	continue_at(cl, bch2_write_index, index_update_wq(op));
-	goto out;
-flush_io:
 	/*
-	 * If the write can't all be submitted at once, we generally want to
-	 * block synchronously as that signals backpressure to the caller.
+	 * Sync or no?
+	 *
+	 * If we're running asynchronously, wne may still want to block
+	 * synchronously here if we weren't able to submit all of the IO at
+	 * once, as that signals backpressure to the caller.
 	 *
 	 * However, if we're running out of a workqueue, we can't block here
 	 * because we'll be blocking other work items from completing:
 	 */
-	if (current->flags & PF_WQ_WORKER) {
-		continue_at(cl, bch2_write_index, index_update_wq(op));
-		goto out;
-	}
-
-	closure_sync(cl);
-
-	if (!bch2_keylist_empty(&op->insert_keys)) {
+	if ((op->flags & BCH_WRITE_SYNC) ||
+	    (!(op->flags & BCH_WRITE_DONE) && !(current->flags & PF_WQ_WORKER))) {
+		closure_sync(cl);
 		__bch2_write_index(op);
 
-		if (op->error) {
-			op->flags |= BCH_WRITE_DONE;
-			continue_at_nobarrier(cl, bch2_write_done, NULL);
-			goto out;
+		if (!(op->flags & BCH_WRITE_DONE)) {
+			goto again;
+		} else if (unlikely(!op->error && (op->flags & BCH_WRITE_FLUSH))) {
+			bch2_journal_flush_seq_async(&c->journal,
+						     op->journal_seq,
+						     cl);
+			continue_at(cl, bch2_write_done, index_update_wq(op));
+		} else {
+			bch2_write_done(&op->cl);
 		}
+	} else {
+		continue_at(cl, bch2_write_index, index_update_wq(op));
 	}
 
-	goto again;
+	memalloc_nofs_restore(nofs_flags);
 }
 
 static void bch2_write_data_inline(struct bch_write_op *op, unsigned data_len)
