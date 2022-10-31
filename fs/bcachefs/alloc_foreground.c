@@ -1362,6 +1362,10 @@ static inline void writepoint_init(struct write_point *wp,
 {
 	mutex_init(&wp->lock);
 	wp->data_type = type;
+
+	INIT_WORK(&wp->index_update_work, bch2_write_point_do_index_updates);
+	INIT_LIST_HEAD(&wp->writes);
+	spin_lock_init(&wp->writes_lock);
 }
 
 void bch2_fs_allocator_foreground_init(struct bch_fs *c)

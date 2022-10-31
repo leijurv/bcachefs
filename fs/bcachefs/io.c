@@ -539,9 +539,9 @@ void bch2_submit_wbio_replicas(struct bch_write_bio *wbio, struct bch_fs *c,
 	}
 }
 
-static void __bch2_write(struct closure *);
+static void __bch2_write(struct bch_write_op *);
 
-static void bch2_write_done(struct closure *cl)
+static void __bch2_write_done(struct closure *cl)
 {
 	struct bch_write_op *op = container_of(cl, struct bch_write_op, cl);
 	struct bch_fs *c = op->c;
@@ -555,9 +555,20 @@ static void bch2_write_done(struct closure *cl)
 
 	bch2_time_stats_update(&c->times[BCH_TIME_data_write], op->start_time);
 
-	EBUG_ON(cl->parent);
 	closure_debug_destroy(cl);
 	op->end_io(op);
+}
+
+static __always_inline void bch2_write_done(struct bch_write_op *op)
+{
+	if (!op->error && (op->flags & BCH_WRITE_FLUSH)) {
+		bch2_journal_flush_seq_async(&op->c->journal,
+					     op->journal_seq,
+					     &op->cl);
+		continue_at(&op->cl, __bch2_write_done, index_update_wq(op));
+	} else {
+		__bch2_write_done(&op->cl);
+	}
 }
 
 static noinline int bch2_write_drop_io_error_ptrs(struct bch_write_op *op)
@@ -651,19 +662,38 @@ err:
 static void bch2_write_index(struct closure *cl)
 {
 	struct bch_write_op *op = container_of(cl, struct bch_write_op, cl);
-	struct bch_fs *c = op->c;
+	struct write_point *wp = op->wp;
+	struct workqueue_struct *wq = index_update_wq(op);
 
-	__bch2_write_index(op);
+	barrier();
+	op->btree_update_ready = true;
+	queue_work(wq, &wp->index_update_work);
+}
 
-	if (!(op->flags & BCH_WRITE_DONE)) {
-		continue_at(cl, __bch2_write, index_update_wq(op));
-	} else if (!op->error && (op->flags & BCH_WRITE_FLUSH)) {
-		bch2_journal_flush_seq_async(&c->journal,
-					     op->journal_seq,
-					     cl);
-		continue_at(cl, bch2_write_done, index_update_wq(op));
-	} else {
-		continue_at_nobarrier(cl, bch2_write_done, NULL);
+void bch2_write_point_do_index_updates(struct work_struct *work)
+{
+	struct write_point *wp =
+		container_of(work, struct write_point, index_update_work);
+	struct bch_write_op *op;
+
+	while (1) {
+		spin_lock(&wp->writes_lock);
+		op = list_first_entry_or_null(&wp->writes, struct bch_write_op, wp_list);
+		if (op && !op->btree_update_ready)
+			op = NULL;
+		if (op)
+			list_del(&op->wp_list);
+		spin_unlock(&wp->writes_lock);
+
+		if (!op)
+			break;
+
+		__bch2_write_index(op);
+
+		if (!(op->flags & BCH_WRITE_DONE))
+			__bch2_write(op);
+		else
+			bch2_write_done(op);
 	}
 }
 
@@ -1108,11 +1138,10 @@ err:
 	return ret;
 }
 
-static void __bch2_write(struct closure *cl)
+static void __bch2_write(struct bch_write_op *op)
 {
-	struct bch_write_op *op = container_of(cl, struct bch_write_op, cl);
 	struct bch_fs *c = op->c;
-	struct write_point *wp;
+	struct write_point *wp = NULL;
 	struct bio *bio = NULL;
 	unsigned nofs_flags;
 	int ret;
@@ -1120,6 +1149,7 @@ static void __bch2_write(struct closure *cl)
 	nofs_flags = memalloc_nofs_save();
 again:
 	memset(&op->failed, 0, sizeof(op->failed));
+	op->btree_update_ready = false;
 
 	do {
 		struct bkey_i *key_to_write;
@@ -1152,9 +1182,8 @@ again:
 			op->alloc_reserve,
 			op->flags,
 			(op->flags & (BCH_WRITE_ALLOC_NOWAIT|
-				      BCH_WRITE_ONLY_SPECIFIED_DEVS)) ? NULL : cl);
-		EBUG_ON(!wp);
-
+				      BCH_WRITE_ONLY_SPECIFIED_DEVS))
+			? NULL : &op->cl);
 		if (IS_ERR(wp)) {
 			if (unlikely(wp != ERR_PTR(-EAGAIN))) {
 				op->error = PTR_ERR(wp);
@@ -1163,19 +1192,10 @@ again:
 
 			break;
 		}
-#if 0
-		/*
-		 * It's possible for the allocator to fail, put us on the
-		 * freelist waitlist, and then succeed in one of various retry
-		 * paths: if that happens, we need to disable the skip_put
-		 * optimization because otherwise there won't necessarily be a
-		 * barrier before we free the bch_write_op:
-		 */
-		if (atomic_read(&cl->remaining) & CLOSURE_WAITING)
-			skip_put = false;
-#endif
+
 		bch2_open_bucket_get(c, wp, &op->open_buckets);
 		ret = bch2_write_extent(op, wp, &bio);
+
 		bch2_alloc_sectors_done(c, wp);
 
 		if (ret < 0) {
@@ -1206,27 +1226,21 @@ again:
 	 * If we're running asynchronously, wne may still want to block
 	 * synchronously here if we weren't able to submit all of the IO at
 	 * once, as that signals backpressure to the caller.
-	 *
-	 * However, if we're running out of a workqueue, we can't block here
-	 * because we'll be blocking other work items from completing:
 	 */
-	if ((op->flags & BCH_WRITE_SYNC) ||
-	    (!(op->flags & BCH_WRITE_DONE) && !(current->flags & PF_WQ_WORKER))) {
-		closure_sync(cl);
+	if ((op->flags & BCH_WRITE_SYNC) || !(op->flags & BCH_WRITE_DONE)) {
+		closure_sync(&op->cl);
 		__bch2_write_index(op);
 
-		if (!(op->flags & BCH_WRITE_DONE)) {
+		if (!(op->flags & BCH_WRITE_DONE))
 			goto again;
-		} else if (unlikely(!op->error && (op->flags & BCH_WRITE_FLUSH))) {
-			bch2_journal_flush_seq_async(&c->journal,
-						     op->journal_seq,
-						     cl);
-			continue_at(cl, bch2_write_done, index_update_wq(op));
-		} else {
-			bch2_write_done(&op->cl);
-		}
+		bch2_write_done(op);
 	} else {
-		continue_at(cl, bch2_write_index, index_update_wq(op));
+		spin_lock(&wp->writes_lock);
+		op->wp = wp;
+		list_add_tail(&op->wp_list, &wp->writes);
+		spin_unlock(&wp->writes_lock);
+
+		continue_at(&op->cl, bch2_write_index, NULL);
 	}
 
 	memalloc_nofs_restore(nofs_flags);
@@ -1234,7 +1248,6 @@ again:
 
 static void bch2_write_data_inline(struct bch_write_op *op, unsigned data_len)
 {
-	struct closure *cl = &op->cl;
 	struct bio *bio = &op->wbio.bio;
 	struct bvec_iter iter;
 	struct bkey_i_inline_data *id;
@@ -1271,10 +1284,9 @@ static void bch2_write_data_inline(struct bch_write_op *op, unsigned data_len)
 	op->flags |= BCH_WRITE_WROTE_DATA_INLINE;
 	op->flags |= BCH_WRITE_DONE;
 
-	continue_at_nobarrier(cl, bch2_write_index, NULL);
-	return;
+	__bch2_write_index(op);
 err:
-	bch2_write_done(&op->cl);
+	bch2_write_done(op);
 }
 
 /**
@@ -1300,6 +1312,7 @@ void bch2_write(struct closure *cl)
 	struct bch_fs *c = op->c;
 	unsigned data_len;
 
+	EBUG_ON(op->cl.parent);
 	BUG_ON(!op->nr_replicas);
 	BUG_ON(!op->write_point.v);
 	BUG_ON(!bkey_cmp(op->pos, POS_MAX));
@@ -1333,18 +1346,13 @@ void bch2_write(struct closure *cl)
 		return;
 	}
 
-	continue_at_nobarrier(cl, __bch2_write, NULL);
+	__bch2_write(op);
 	return;
 err:
 	bch2_disk_reservation_put(c, &op->res);
 
-	if (op->end_io) {
-		EBUG_ON(cl->parent);
-		closure_debug_destroy(cl);
-		op->end_io(op);
-	} else {
-		closure_return(cl);
-	}
+	closure_debug_destroy(&op->cl);
+	op->end_io(op);
 }
 
 /* Cache promotion on read */
